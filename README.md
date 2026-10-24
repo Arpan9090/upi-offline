@@ -442,4 +442,4 @@ When discussing or evaluating this architecture, consider the following real-wor
 ---
 
 ## 📄 License
-This project is open-source under the MIT License. Feel free to use, modify, and integrate it into your own research and portfolio projects.
+Feel free to use, modify, and integrate it into your own research and portfolio projects.
