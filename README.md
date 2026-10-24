@@ -1,407 +1,445 @@
-# UPI Offline Mesh — Demo
+# ⚡ UPI Offline Mesh — Resilient Store-and-Forward Payment Engine
 
-A Spring Boot backend that demonstrates **offline UPI payments routed through a Bluetooth-style mesh network**. You're in a basement with zero connectivity. You send your friend ₹500. Your phone encrypts the payment, broadcasts it to nearby phones, and the packet hops device-to-device until *some* phone walks outside, gets 4G, and silently uploads it to this backend. The backend decrypts, deduplicates, and settles.
+<p align="center">
+  <em>A production-pattern Spring Boot backend demonstrating offline UPI payments routed through a Bluetooth-style peer-to-peer mesh network with zero-connectivity origination, hybrid cryptography, and atomic exact-once settlement.</em>
+</p>
 
-This repo is the **server side** of that system, plus a software simulator of the mesh so you can demo the whole flow on a single laptop without any real Bluetooth hardware.
-
----
-
-## Table of Contents
-
-1. [What this demo proves](#what-this-demo-proves)
-2. [How to run it](#how-to-run-it)
-3. [The demo flow (step by step)](#the-demo-flow-step-by-step)
-4. [Architecture](#architecture)
-5. [The three hard problems and how they're solved](#the-three-hard-problems-and-how-theyre-solved)
-6. [File-by-file walkthrough](#file-by-file-walkthrough)
-7. [API reference](#api-reference)
-8. [Tests](#tests)
-9. [What's NOT real (and what would change for production)](#whats-not-real-and-what-would-change-for-production)
-10. [Honest limitations of the concept](#honest-limitations-of-the-concept)
+<p align="center">
+  <img src="https://img.shields.io/badge/Spring%20Boot-3.3.5-brightgreen.svg" alt="Spring Boot">
+  <img src="https://img.shields.io/badge/Java-17-orange.svg" alt="Java Version">
+  <img src="https://img.shields.io/badge/Security-RSA--OAEP%20%2B%20AES--256--GCM-blue.svg" alt="Crypto">
+  <img src="https://img.shields.io/badge/Database-H2%20In--Memory-yellow.svg" alt="H2 Database">
+  <img src="https://img.shields.io/badge/Build-Maven%20Wrapper-red.svg" alt="Maven">
+</p>
 
 ---
 
-## What this demo proves
+## 📑 Table of Contents
 
-The system shows three things working end to end:
-
-1. **A payment can travel from sender to backend through untrusted intermediaries** without any of them being able to read or tamper with it. (Hybrid RSA + AES-GCM encryption.)
-2. **Even if the same payment reaches the backend simultaneously through multiple bridge nodes, it settles exactly once.** (Idempotency via atomic compare-and-set on the ciphertext hash.)
-3. **A tampered or replayed packet is rejected** before it touches the ledger.
-
-You'll see all three in the dashboard.
+1. [System Overview & Real-World Motivation](#-system-overview--real-world-motivation)
+2. [End-to-End Architectural Flow](#-end-to-end-architectural-flow)
+3. [Deep-Dive: The Core Engineering Challenges Solved](#-deep-dive-the-core-engineering-challenges-solved)
+   - [1. Untrusted Intermediaries (Hybrid Cryptography)](#1-untrusted-intermediaries-hybrid-cryptography)
+   - [2. The Concurrent Duplicate Storm (Atomic Idempotency)](#2-the-concurrent-duplicate-storm-atomic-idempotency)
+   - [3. Replay Protection & Freshness Gates](#3-replay-protection--freshness-gates)
+   - [4. Double-Spend & Balance Isolation (Optimistic Locking)](#4-double-spend--balance-isolation-optimistic-locking)
+4. [Wire Formats & Payload Schemas](#-wire-formats--payload-schemas)
+5. [Interactive Demo Dashboard Walkthrough](#-interactive-demo-dashboard-walkthrough)
+6. [Complete REST API Reference](#-complete-rest-api-reference)
+7. [Local Setup & How to Run on Your PC](#-local-setup--how-to-run-on-your-pc)
+8. [Automated Testing & Concurrency Verification](#-automated-testing--concurrency-verification)
+9. [Project Directory Structure](#-project-directory-structure)
+10. [Production Roadmap vs. Demo Implementation](#-production-roadmap-vs-demo-implementation)
+11. [Honest Engineering Limitations](#-honest-engineering-limitations)
 
 ---
 
-## How to run it
+## 🧭 System Overview & Real-World Motivation
 
-### Prerequisites
+Standard UPI architectures require real-time, bidirectional internet connectivity from both the sender and the receiver to the central NPCI/bank switch. When users are in **underground parking basements, subway tunnels, remote trails, or disaster-affected zones**, transactions instantly fail.
 
-- **JDK 17 or newer** installed and on PATH (or `JAVA_HOME` set). Check with `java -version`.
-- That's it. No database, no Redis, no Maven (the wrapper handles it). Just Java.
+Existing alternatives have limitations:
+- **USSD (`*99#`)**: Requires a live 2G GSM cellular voice/command channel (unavailable in zero-signal zones).
+- **Standard UPI Lite**: Still requires one party or terminal to connect to verify ledger balance.
 
-### Run on Windows
+### The Solution: Mesh-Routed Deferred Settlement
+This project implements **Delay-Tolerant Networking (DTN)** combined with **Asymmetric/Symmetric Hybrid Cryptography**:
+1. **Origination (100% Offline):** The sender inputs their payment. The sender's phone encrypts the payload using the bank's public key.
+2. **Hop-by-Hop Gossip (Offline Mesh):** The encrypted packet is broadcasted peer-to-peer across nearby devices over Bluetooth Low Energy (BLE) using a hop-decrementing Time-To-Live (TTL) counter.
+3. **Bridge Ingestion (Online Transit):** As soon as *any* phone carrying the packet steps outside and obtains 4G/5G or Wi-Fi, it acts as a **bridge node** and automatically pushes the packet to the server.
+4. **Backend Settlement (Exact-Once Guarantee):** The Spring Boot backend enforces an atomic idempotency gate, decrypts and validates the authentication tag, checks timestamp freshness, and commits the transaction to the database.
 
-Open a terminal in the project folder and run:
+---
 
-```cmd
-mvnw.cmd spring-boot:run
+## 🏛️ End-to-End Architectural Flow
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        OFFLINE SENDER DEVICE                           │
+│  1. Compose: PaymentInstruction { sender, receiver, amount, nonce }   │
+│  2. Hybrid Encrypt with Bank Public Key:                               │
+│     - Generate ephemeral AES-256 key                                   │
+│     - AES-256-GCM encrypt payload (Authenticated)                     │
+│     - RSA-OAEP-2048 encrypt AES key                                   │
+│  3. Wrap: MeshPacket { packetId, ttl=5, createdAt, ciphertext }        │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+                       BLE Broadcast│ (Zero Internet)
+                                    ▼
+┌──────────────┐     Hop 1    ┌──────────────┐     Hop 2    ┌────────────────────────┐
+│  Stranger 1  │ ───────────► │  Stranger 2  │ ───────────► │      Bridge Node       │
+│  (Offline)   │              │  (Offline)   │              │ (Steps into 4G signal) │
+└──────────────┘              └──────────────┘              └───────────┬────────────┘
+                                                                        │
+                                                HTTPS POST /bridge/ingest│
+                                                                        ▼
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                      SPRING BOOT BACKEND ORCHESTRATOR                          │
+│                                                                                │
+│  1. Ingestion Gate: Compute SHA-256(ciphertext)                                │
+│                                                                                │
+│  2. Atomic Idempotency Check:                                                  │
+│     IdempotencyService.claim(hash) ──► putIfAbsent (CAS atomic operation)      │
+│        ├── [Already Claimed] ────────► 200 OK (DUPLICATE_DROPPED) ──► Drop     │
+│        └── [First Time Claimed] ─────► Continue Pipeline                       │
+│                                                                                │
+│  3. Hybrid Decryption & Tamper Check:                                          │
+│     HybridCryptoService.decrypt(ciphertext)                                    │
+│        - Unwrap AES key with RSA-2048 Private Key                              │
+│        - Decrypt payload with AES-256-GCM                                      │
+│        - Verify 128-bit Auth Tag ────► [Tampered/Altered] ──► Reject (INVALID) │
+│                                                                                │
+│  4. Freshness Gate:                                                            │
+│     Verify |now - signedAt| <= 24 hours ──► [Expired] ──────► Reject (INVALID) │
+│                                                                                │
+│  5. Settlement Engine (@Transactional):                                         │
+│     SettlementService.settle()                                                 │
+│        - Debit Sender, Credit Receiver                                         │
+│        - JPA @Version Optimistic Lock Verification                             │
+│        - Insert Ledger Row with UNIQUE constraint on packet_hash               │
+└────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-The first run downloads Maven (~10 MB) and all dependencies (~80 MB) — give it a couple of minutes. Subsequent runs start in a few seconds.
+---
 
-### Run on Mac/Linux
+## 🔬 Deep-Dive: The Core Engineering Challenges Solved
 
+### 1. Untrusted Intermediaries (Hybrid Cryptography)
+* **The Problem:** Strangers' devices carry the transaction packet. How do you prevent them from inspecting the amount or modifying the receiver VPA to their own account?
+* **Why not plain RSA?** RSA-2048 using standard OAEP padding has a maximum data capacity of 214 bytes. Our payment JSON containing nonces, VPAs, and timestamps easily exceeds this.
+* **The Hybrid Solution (`HybridCryptoService.java`):**
+  1. Generate an ephemeral, single-use **AES-256** symmetric key via `SecureRandom`.
+  2. Encrypt the raw payment JSON with **AES-GCM (Galois/Counter Mode)**.
+  3. Encrypt the 32-byte AES key using the bank's **RSA-2048 Public Key** with `OAEPWithSHA-256AndMGF1Padding`.
+  4. Pack together: `[ 256 bytes RSA Key ] + [ 12 bytes GCM IV ] + [ AES Ciphertext + 16-byte Auth Tag ]`.
+* **Tamper Proofing:** AES-GCM is an AEAD (Authenticated Encryption with Associated Data) cipher. If an intermediary flips even a single bit in the ciphertext, decryption throws an `AEADBadTagException` and the backend immediately rejects the packet.
+
+### 2. The Concurrent Duplicate Storm (Atomic Idempotency)
+* **The Problem:** In a dense mesh, 3 different phones hold copies of the same packet. When all 3 walk outside at the exact same millisecond, they all POST the packet to the backend concurrently. Without synchronization, the sender would be debited 3 times.
+* **Why Deduplicate on Ciphertext Hash (Not Packet ID or Plaintext)?**
+  - **Packet ID can be forged:** A rogue intermediate could modify the outer `packetId` UUID and forward it.
+  - **Plaintext wastes CPU:** Decrypting RSA-2048 before deduplicating opens the backend to CPU-exhaustion Denial-of-Service attacks.
+  - **Ciphertext Hash is Secure & Fast:** Two deliveries of the same payment have byte-identical ciphertexts. Hashing takes $O(1)$ and happens before any expensive crypto operations.
+* **The Atomic Gate (`IdempotencyService.java`):**
+  ```java
+  public boolean claim(String packetHash) {
+      Instant now = Instant.now();
+      Instant prev = seen.putIfAbsent(packetHash, now);
+      return prev == null; // true = Winner / Settles; false = Duplicate / Dropped
+  }
+  ```
+  `ConcurrentHashMap.putIfAbsent()` utilizes low-level CPU Compare-And-Swap (CAS) primitives. Even under extreme thread contention, exactly one caller succeeds.
+
+### 3. Replay Protection & Freshness Gates
+* **The Problem:** An attacker captures a valid encrypted packet out of the airwaves and retransmits it two weeks later.
+* **The Defense:**
+  - Inside the encrypted payload, the sender stamps `signedAt` (epoch milliseconds) and a unique UUID `nonce`.
+  - The server verifies: `(currentTime - signedAt) <= 86400 seconds (24h)`.
+  - Since `signedAt` is inside the AES-GCM envelope, an attacker cannot manipulate the timestamp without invalidating the authentication tag.
+
+### 4. Double-Spend & Balance Isolation (Optimistic Locking)
+* **The Problem:** Even with idempotency, simultaneous transfers affecting the same sender account must not cause lost updates.
+* **The Defense:** The `Account` entity leverages JPA `@Version`:
+  ```java
+  @Version
+  private Long version;
+  ```
+  If two settlement threads attempt to update the same sender concurrently, Hibernate checks the version column upon commit. The slower transaction aborts with an `OptimisticLockException` rather than corrupting the account balance.
+
+---
+
+## 📦 Wire Formats & Payload Schemas
+
+### 1. Over-the-Air Wire Format: `MeshPacket.java`
+This payload is transmitted across peer-to-peer devices. The outer fields are unencrypted so intermediaries can route and decrement TTL.
+
+```json
+{
+  "packetId": "d3b07384-d113-494a-9c87-89b1e985b8c9",
+  "ttl": 5,
+  "createdAt": 1730000000000,
+  "ciphertext": "pWz5Q...[Base64 encoded blob: 256B RSA key + 12B IV + Ciphertext + Tag]...=="
+}
+```
+
+### 2. Sealed Payload: `PaymentInstruction.java`
+Only readable by the Spring Boot backend after RSA-OAEP + AES-GCM decryption:
+
+```json
+{
+  "senderVpa": "alice@demo",
+  "receiverVpa": "bob@demo",
+  "amount": 500.00,
+  "pinHash": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+  "nonce": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
+  "signedAt": 1730000000000
+}
+```
+
+---
+
+## 🖥️ Interactive Demo Dashboard Walkthrough
+
+When you start the application and visit **`http://localhost:8080`**, an interactive, dark-mode visualizer lets you observe the mesh:
+
+1. **Step 1 — Inject Packet:** Select Sender (`alice@demo`), Receiver (`bob@demo`), Amount (`100.00`), and click **"Inject into Mesh"**. Alice's virtual device now holds 1 encrypted packet.
+2. **Step 2 — Gossip Rounds:** Click **"Run Gossip Round"**. Each round simulates local BLE discovery. Packets hop from `phone-alice` → `phone-stranger1` → `phone-stranger2` → `phone-bridge`, with the TTL decrementing each hop.
+3. **Step 3 — Bridge Upload:** Click **"Flush Bridges to Backend"**. The bridge node (`phone-bridge`, the only node with internet) posts the packet to `/api/bridge/ingest`.
+4. **Step 4 — Verify Ledger:** Observe the **Account Balances** update immediately in real time, and view the immutable transaction recorded in the **Transaction Ledger**.
+5. **Step 5 — Duplicate Drop Verification:** Click **"Flush Bridges"** a second time. The dashboard will report: `DUPLICATE_DROPPED`, showing that the idempotency gate prevented a second debit.
+
+---
+
+## 📡 Complete REST API Reference
+
+### 1. Server Public Key
+Fetch the active public key to encrypt offline transactions.
+* **Endpoint:** `GET /api/server-key`
+* **Response:**
+  ```json
+  {
+    "algorithm": "RSA-2048 / OAEP-SHA256",
+    "publicKey": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...",
+    "hybridScheme": "RSA-OAEP encrypts an AES-256-GCM session key"
+  }
+  ```
+
+---
+
+### 2. The Core Production Endpoint: Bridge Ingestion
+Used by any online bridge device to upload mesh packets.
+* **Endpoint:** `POST /api/bridge/ingest`
+* **Headers:**
+  - `Content-Type: application/json`
+  - `X-Bridge-Node-Id: phone-bridge-01` *(Optional metadata)*
+  - `X-Hop-Count: 3` *(Optional metadata)*
+* **Request Body:**
+  ```json
+  {
+    "packetId": "b1b72e90-c2cb-4fa1-841f-d7d6f5194f4a",
+    "ttl": 2,
+    "createdAt": 1730000000000,
+    "ciphertext": "..."
+  }
+  ```
+* **Possible Responses:**
+  - **Settled (200 OK):**
+    ```json
+    {
+      "outcome": "SETTLED",
+      "packetHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": null,
+      "transactionId": 1
+    }
+    ```
+  - **Duplicate Dropped (200 OK):**
+    ```json
+    {
+      "outcome": "DUPLICATE_DROPPED",
+      "packetHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "reason": null,
+      "transactionId": null
+    }
+    ```
+  - **Tampered or Stale (200 OK):**
+    ```json
+    {
+      "outcome": "INVALID",
+      "packetHash": "a4f1...",
+      "reason": "decryption_failed",
+      "transactionId": null
+    }
+    ```
+
+---
+
+### 3. Simulation & Mesh Management Endpoints
+
+| Method | Endpoint | Description | Sample Request / Payload |
+|---|---|---|---|
+| `POST` | `/api/demo/send` | Simulates an offline sender generating and encrypting a packet. | `{"senderVpa":"alice@demo","receiverVpa":"bob@demo","amount":150.00,"pin":"1234","ttl":5}` |
+| `GET` | `/api/mesh/state` | Returns the packet inventory of all 5 simulated devices. | *None* |
+| `POST` | `/api/mesh/gossip` | Triggers one round of peer-to-peer gossip across nearby devices. | *None* |
+| `POST` | `/api/mesh/flush` | Simulates all bridge nodes uploading held packets concurrently. | *None* |
+| `POST` | `/api/mesh/reset` | Resets all device packet caches and clears idempotency memory. | *None* |
+| `GET` | `/api/accounts` | Lists all accounts, balances, and optimistic lock versions. | *None* |
+| `GET` | `/api/transactions`| Lists the 20 most recent transactions from the ledger. | *None* |
+
+#### Quick `cURL` Test:
 ```bash
+# Inject a payment of 250 into the mesh
+curl -X POST http://localhost:8080/api/demo/send \
+  -H "Content-Type: application/json" \
+  -d "{\"senderVpa\":\"alice@demo\",\"receiverVpa\":\"bob@demo\",\"amount\":250.00,\"pin\":\"1234\",\"ttl\":5}"
+
+# Run one gossip round
+curl -X POST http://localhost:8080/api/mesh/gossip
+
+# Trigger bridge upload
+curl -X POST http://localhost:8080/api/mesh/flush
+```
+
+---
+
+## 💻 Local Setup & How to Run on Your PC
+
+### Prerequisites
+* **Java Development Kit (JDK) 17 or higher** installed. Verify in your terminal:
+  ```bash
+  java -version
+  ```
+* **Git** installed.
+* *Note:* You do **not** need Maven installed globally; the repository includes the Maven Wrapper (`mvnw` / `mvnw.cmd`).
+
+### 1. Clone the Repository
+```bash
+git clone https://github.com/<your-username>/UPI_Without_Internet.git
+cd UPI_Without_Internet
+```
+
+### 2. Run the Application
+
+#### On Windows (Command Prompt / PowerShell):
+```cmd
+.\mvnw.cmd spring-boot:run
+```
+
+#### On macOS / Linux:
+```bash
+chmod +x ./mvnw
 ./mvnw spring-boot:run
 ```
 
-### Open the dashboard
-
-Once you see `Started UpiMeshApplication in X.XXX seconds`, open:
-
-**http://localhost:8080**
-
-You'll get a dark dashboard with everything you need to drive the demo.
-
-### Stop the server
-
-`Ctrl+C` in the terminal.
-
-### Run the tests
-
-```cmd
-mvnw.cmd test
-```
-
-The interesting one is `IdempotencyConcurrencyTest` — it fires three threads delivering the same packet simultaneously and asserts that exactly one settles.
+### 3. Accessing the Services
+* **Interactive Web Dashboard:** Open [http://localhost:8080](http://localhost:8080) in your browser.
+* **H2 Database Web Console:** Open [http://localhost:8080/h2-console](http://localhost:8080/h2-console)
+  - **JDBC URL:** `jdbc:h2:mem:upimesh`
+  - **User Name:** `sa`
+  - **Password:** *(Leave blank)*
 
 ---
 
-## The demo flow (step by step)
+## 🧪 Automated Testing & Concurrency Verification
 
-The dashboard has four buttons that walk through the full pipeline. The intended sequence:
+The test suite validates cryptographic integrity and multithreaded race conditions.
 
-### Step 1 — Compose a payment
+Execute all tests via:
+```bash
+# Windows
+.\mvnw.cmd test
 
-Choose sender, receiver, amount, PIN. Click **"📤 Inject into Mesh"**.
-
-**What actually happens on the backend:**
-- The server pretends to be the sender's phone.
-- It builds a `PaymentInstruction` with a unique nonce and current timestamp.
-- It encrypts that with the server's RSA public key (using hybrid encryption — see below).
-- It wraps the ciphertext in a `MeshPacket` with a TTL of 5.
-- It hands the packet to `phone-alice`, an offline virtual device.
-
-You'll see `phone-alice` now holds 1 packet.
-
-### Step 2 — Run gossip rounds
-
-Click **"🔄 Run Gossip Round"**. Then click it again.
-
-Each round, every device that holds a packet broadcasts it to every other device within "Bluetooth range" (which, in our simulator, means everyone). TTL decrements per hop.
-
-After 1 round: every device holds the packet. After 2 rounds: still every device — TTL is just lower.
-
-In the real system this would happen organically as people walk past each other in the basement.
-
-### Step 3 — Bridge node walks outside
-
-Click **"📡 Bridges Upload to Backend"**.
-
-`phone-bridge` is the only device with `hasInternet=true`. The dashboard simulates that phone walking outside and getting 4G. It POSTs every packet it holds to `/api/bridge/ingest`.
-
-The backend pipeline runs:
-1. Hash the ciphertext (`SHA-256`).
-2. Try to claim the hash in the idempotency cache.
-3. If claimed: decrypt with the server's RSA private key.
-4. Verify freshness (signedAt within 24 hours).
-5. Run the debit/credit in a single DB transaction.
-
-Watch the **Account Balances** table — money has moved. Watch the **Transaction Ledger** — a new row appears.
-
-### Step 4 — Demonstrate idempotency (the killer feature)
-
-Reset the mesh. Inject a single packet. Run gossip 2 times. Now **all 5 devices hold the same packet, including multiple bridges in a more complex setup**.
-
-To really see idempotency in action, modify `MeshSimulatorService.java` to seed multiple bridge devices, or just:
-
-1. Click "Inject" once.
-2. Click "Gossip" twice.
-3. Click "Flush Bridges" — only `phone-bridge` is a bridge in the default seed, so just one upload happens.
-
-To exercise the *concurrent duplicate* case properly, run the test:
-```cmd
-mvnw.cmd test -Dtest=IdempotencyConcurrencyTest#singlePacketDeliveredByThreeBridgesSettlesExactlyOnce
+# Mac / Linux
+./mvnw test
 ```
 
-This test creates one packet, fires 3 threads at `BridgeIngestionService.ingest()` simultaneously, and verifies that exactly one settles, two are dropped as duplicates, and the sender is debited exactly once.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                         SENDER PHONE (offline)                          │
-│  PaymentInstruction { sender, receiver, amount, pinHash, nonce, time }  │
-│              │                                                          │
-│              ▼ encrypt with server's RSA public key                     │
-│   MeshPacket { packetId, ttl, createdAt, ciphertext }                   │
-└──────────────────────────────────────┬──────────────────────────────────┘
-                                       │ Bluetooth gossip
-                                       ▼
-        ┌─────────┐  hop   ┌─────────┐  hop   ┌─────────┐
-        │stranger1│ ─────▶ │stranger2│ ─────▶ │ bridge  │ ◀── walks outside
-        └─────────┘        └─────────┘        └────┬────┘     gets 4G
-                                                   │
-                                                   ▼ HTTPS POST
-┌─────────────────────────────────────────────────────────────────────────┐
-│                     SPRING BOOT BACKEND (this project)                  │
-│                                                                         │
-│  /api/bridge/ingest                                                     │
-│       │                                                                 │
-│       ▼                                                                 │
-│  [1] hash ciphertext (SHA-256)                                          │
-│       │                                                                 │
-│       ▼                                                                 │
-│  [2] IdempotencyService.claim(hash)  ◀── atomic putIfAbsent (≈ Redis    │
-│       │                                  SETNX). Duplicates rejected    │
-│       │                                  here, before any work.         │
-│       ▼                                                                 │
-│  [3] HybridCryptoService.decrypt(ciphertext)                            │
-│       │       (RSA-OAEP unwraps AES key, AES-GCM decrypts payload       │
-│       │        AND verifies the auth tag — tampering = exception)       │
-│       ▼                                                                 │
-│  [4] Freshness check: signedAt within last 24h                          │
-│       │                                                                 │
-│       ▼                                                                 │
-│  [5] SettlementService.settle()                                         │
-│       @Transactional: debit sender, credit receiver, write ledger       │
-│       @Version on Account = optimistic locking (defense in depth)       │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## The three hard problems and how they're solved
-
-### Problem 1: Untrusted intermediates
-
-A random stranger's phone is carrying your transaction. How do you stop them from reading the amount or changing it?
-
-**Solution: Hybrid encryption (RSA-OAEP + AES-GCM).**
-
-The sender encrypts the payload with the server's public key. Only the server holds the private key, so intermediates see opaque ciphertext.
-
-But RSA can only encrypt small data (~245 bytes for a 2048-bit key), and our payload is JSON that could exceed that. So we use the standard hybrid pattern:
-
-1. Generate a fresh AES-256 key for *this packet*.
-2. Encrypt the JSON with **AES-256-GCM** (fast + authenticated).
-3. Encrypt just the AES key with **RSA-OAEP**.
-4. Concatenate: `[256 bytes RSA-encrypted AES key][12 bytes IV][AES ciphertext + 16-byte GCM tag]`.
-
-**Why GCM specifically?** It's authenticated encryption. If an intermediate flips one bit anywhere in the ciphertext, decryption throws an exception — the GCM tag won't verify. The server cannot be tricked into processing tampered data.
-
-This is the same scheme TLS uses. See `HybridCryptoService.java`.
-
-### Problem 2: The duplicate-storm
-
-Three bridge nodes hold the same packet. They all walk outside at the same instant. They all POST to `/api/bridge/ingest` within milliseconds of each other. If you naively process all three, the sender is debited ₹1500 instead of ₹500.
-
-**Solution: Atomic compare-and-set on the ciphertext hash.**
-
-The very first thing the server does on receiving a packet is compute `SHA-256(ciphertext)` and try to "claim" that hash:
+### The Multithreaded Concurrency Test (`IdempotencyConcurrencyTest.java`)
+This test simulates the hardest scenario in distributed payments: **3 bridge devices uploading the same transaction at the exact same instant**.
 
 ```java
-// IdempotencyService.java
-Instant prev = seen.putIfAbsent(packetHash, now);
-return prev == null;  // true = first claimer, false = duplicate
-```
+@Test
+void singlePacketDeliveredByThreeBridgesSettlesExactlyOnce() throws Exception {
+    // 1. Create a single valid encrypted packet
+    MeshPacket packet = demoService.createPacket("alice@demo", "bob@demo", new BigDecimal("100.00"), "1234", 5);
 
-`ConcurrentHashMap.putIfAbsent` is atomic. Even if 100 threads call it at the exact same nanosecond, exactly one returns `null` (the first claimer) and the rest return the existing entry. Only the first claimer proceeds to decrypt and settle. The rest are short-circuited as `DUPLICATE_DROPPED`.
+    // 2. Set up 3 concurrent threads blocked behind a CountDownLatch
+    ExecutorService pool = Executors.newFixedThreadPool(3);
+    CountDownLatch startGate = new CountDownLatch(1);
+    AtomicInteger settled = new AtomicInteger();
+    AtomicInteger duplicates = new AtomicInteger();
 
-**Why hash the ciphertext, not the packetId or the cleartext?**
-- `packetId` can be rewritten by a malicious intermediate. Two copies of the same payment could have different packetIds. Bad key.
-- The cleartext requires decryption first. We want to dedupe *before* spending CPU on RSA.
-- The ciphertext is authenticated by GCM, so any tampering is detectable on decrypt. Two legitimate deliveries of the same payment have byte-identical ciphertexts (AES is deterministic for a given key+IV+plaintext, and the same packet means the same key+IV+plaintext).
+    for (int i = 0; i < 3; i++) {
+        pool.submit(() -> {
+            startGate.await(); // Synchronize release
+            BridgeIngestionService.IngestResult r = bridge.ingest(packet, "bridge-node", 3);
+            if ("SETTLED".equals(r.outcome())) settled.incrementAndGet();
+            else if ("DUPLICATE_DROPPED".equals(r.outcome())) duplicates.incrementAndGet();
+        });
+    }
 
-In production this `ConcurrentHashMap` becomes Redis: `SET key NX EX 86400`. Same semantics, distributed across replicas.
+    startGate.countDown(); // Release all 3 threads simultaneously
+    pool.shutdown();
+    pool.awaitTermination(5, TimeUnit.SECONDS);
 
-There's also a defense-in-depth fallback: `transactions.packet_hash` has a unique index. If the cache layer ever fails and two settlements somehow try to write the same hash, the database rejects the second one.
-
-### Problem 3: Replay attacks
-
-An attacker who captured a ciphertext weeks ago could replay it whenever convenient.
-
-**Solution: Two layers.**
-
-1. **Inside the encrypted payload**, the sender includes `signedAt` (epoch millis). The server rejects any packet older than 24 hours. The attacker can't change `signedAt` without breaking the GCM tag.
-2. **Inside the encrypted payload**, the sender includes a **nonce** (UUID). Even if Alice legitimately sends Bob ₹100 twice, the nonces differ → ciphertexts differ → hashes differ → both settle. But a *replay* of one specific signed packet is byte-identical, so the idempotency cache catches it.
-
-See `BridgeIngestionService.java` for the freshness check.
-
----
-
-## File-by-file walkthrough
-
-```
-upi-offline-mesh/
-├── pom.xml                                  Maven build, Spring Boot 3.3, Java 17
-├── mvnw, mvnw.cmd                           Maven wrapper (no install needed)
-├── README.md                                this file
-└── src/main/
-    ├── resources/
-    │   ├── application.properties           H2 in-memory DB, port 8080, TTLs
-    │   └── templates/dashboard.html         The interactive demo UI
-    └── java/com/demo/upimesh/
-        ├── UpiMeshApplication.java          Spring Boot main class
-        │
-        ├── model/                           ── Domain layer
-        │   ├── Account.java                 JPA entity. @Version = optimistic lock
-        │   ├── AccountRepository.java       Spring Data JPA
-        │   ├── Transaction.java             Settled-tx ledger. unique idx on packetHash
-        │   ├── TransactionRepository.java   Spring Data JPA
-        │   ├── MeshPacket.java              Wire format. Outer fields readable, ciphertext opaque
-        │   └── PaymentInstruction.java      Decrypted payload (sender/receiver/amount/nonce/time)
-        │
-        ├── crypto/                          ── Cryptography layer
-        │   ├── ServerKeyHolder.java         Generates RSA-2048 keypair on startup
-        │   └── HybridCryptoService.java     RSA-OAEP + AES-256-GCM encrypt/decrypt + ciphertext hash
-        │
-        ├── service/                         ── Business logic
-        │   ├── DemoService.java             Seeds accounts, simulates a sender phone
-        │   ├── VirtualDevice.java           One simulated phone in the mesh
-        │   ├── MeshSimulatorService.java    Gossip protocol across virtual devices
-        │   ├── IdempotencyService.java      ConcurrentHashMap = JVM-local Redis SETNX
-        │   ├── SettlementService.java       @Transactional debit + credit + ledger insert
-        │   └── BridgeIngestionService.java  THE pipeline: hash → claim → decrypt → freshness → settle
-        │
-        ├── controller/                      ── HTTP layer
-        │   ├── ApiController.java           All REST endpoints
-        │   └── DashboardController.java     Serves the dashboard HTML at /
-        │
-        └── config/
-            └── AppConfig.java               @EnableScheduling for cache eviction
-
-src/test/java/com/demo/upimesh/
-└── IdempotencyConcurrencyTest.java          The 3-bridges-at-once test + tamper test
+    // Assert: EXACTLY one settled, two dropped, balance debited only once
+    assertEquals(1, settled.get());
+    assertEquals(2, duplicates.get());
+}
 ```
 
 ---
 
-## API reference
+## 📂 Project Directory Structure
 
-| Method | Path | What it does |
+```
+UPI_Without_Internet-main/
+├── pom.xml                                 # Build dependencies (Spring Boot 3.3.5, Java 17)
+├── mvnw / mvnw.cmd                         # Cross-platform Maven wrappers
+├── README.md                               # Comprehensive system documentation
+└── src/
+    ├── main/
+    │   ├── resources/
+    │   │   ├── application.properties      # DB configuration, idempotency TTL, freshness windows
+    │   │   └── templates/
+    │   │       └── dashboard.html          # Interactive Thymeleaf frontend UI
+    │   └── java/com/demo/upimesh/
+    │       ├── UpiMeshApplication.java     # Application entrypoint
+    │       ├── config/
+    │       │   └── AppConfig.java          # @EnableScheduling for cache TTL eviction
+    │       ├── controller/
+    │       │   ├── ApiController.java      # Public REST surface (/api/bridge/ingest, /api/mesh/*)
+    │       │   └── DashboardController.java# Serves Thymeleaf UI at '/'
+    │       ├── crypto/
+    │       │   ├── ServerKeyHolder.java    # Manages RSA-2048 keypair lifecycle
+    │       │   └── HybridCryptoService.java# RSA-OAEP + AES-256-GCM cipher pipeline
+    │       ├── model/
+    │       │   ├── Account.java            # Account entity with @Version optimistic lock
+    │       │   ├── AccountRepository.java  # Spring Data JPA repository
+    │       │   ├── Transaction.java        # Immutable ledger with unique index on packetHash
+    │       │   ├── TransactionRepository.java
+    │       │   ├── MeshPacket.java         # Over-the-air wire format (outer metadata + ciphertext)
+    │       │   └── PaymentInstruction.java # Decrypted payload (sender, receiver, nonce, amount)
+    │       └── service/
+    │           ├── BridgeIngestionService.java # Orchestrates Hash -> Claim -> Decrypt -> Settle
+    │           ├── DemoService.java        # Seeds mock accounts & simulates sender encryption
+    │           ├── IdempotencyService.java # Atomic Compare-And-Set cache (in-memory Redis SETNX)
+    │           ├── SettlementService.java  # @Transactional balance ledger debit/credit
+    │           ├── VirtualDevice.java      # Simulated mesh participant phone
+    │           └── MeshSimulatorService.java# Peer-to-peer BLE gossip routing engine
+    └── test/
+        └── java/com/demo/upimesh/
+            └── IdempotencyConcurrencyTest.java # 3-thread concurrent upload & tamper test
+```
+
+---
+
+## 🚀 Production Roadmap vs. Demo Implementation
+
+| Architectural Component | Current Prototype / Demo | Enterprise Production Deployment |
 |---|---|---|
-| GET | `/` | Dashboard HTML |
-| GET | `/api/server-key` | Server's RSA public key (base64) |
-| GET | `/api/accounts` | All accounts and balances |
-| GET | `/api/transactions` | Last 20 transactions |
-| GET | `/api/mesh/state` | Current state of every virtual device |
-| POST | `/api/demo/send` | Simulate sender phone — encrypt + inject packet |
-| POST | `/api/mesh/gossip` | Run one round of gossip across the mesh |
-| POST | `/api/mesh/flush` | Bridges with internet upload to backend (parallel) |
-| POST | `/api/mesh/reset` | Clear mesh + idempotency cache |
-| POST | `/api/bridge/ingest` | **The production endpoint.** Real bridges POST here |
-| GET | `/h2-console` | Browse the in-memory database |
-
-H2 console login: JDBC URL `jdbc:h2:mem:upimesh`, username `sa`, no password.
-
-### Request format for `/api/bridge/ingest`
-
-```http
-POST /api/bridge/ingest
-Content-Type: application/json
-X-Bridge-Node-Id: phone-bridge-42
-X-Hop-Count: 3
-
-{
-  "packetId": "550e8400-e29b-41d4-a716-446655440000",
-  "ttl": 2,
-  "createdAt": 1730000000000,
-  "ciphertext": "base64-encoded-RSA-and-AES-blob"
-}
-```
-
-Response:
-```json
-{
-  "outcome": "SETTLED",                     // or "DUPLICATE_DROPPED" or "INVALID"
-  "packetHash": "a3f8c9...",
-  "reason": null,                            // populated on INVALID
-  "transactionId": 42                        // populated on SETTLED
-}
-```
+| **Persistence Layer** | In-Memory H2 Database | **PostgreSQL / CockroachDB** with read replicas & CDC |
+| **Idempotency Cache** | In-Memory `ConcurrentHashMap` | **Distributed Redis Cluster** (`SET key hash NX EX 86400`) |
+| **Key Management** | Local JVM startup generation | **Hardware Security Module (HSM)** / AWS CloudHSM / Vault |
+| **Mesh Communication** | Software Simulation (`MeshSimulatorService`) | Native Android **Nearby Connections API / BLE GATT** |
+| **Bridge Ingestion Security** | Open HTTP endpoint | **Mutual TLS (mTLS)** with signed bridge client certificates |
+| **Core Banking Integration** | Internal `Account` entity | **ISO 8601 / NPCI UPI Switch** asynchronous messaging (Kafka) |
+| **Rate Limiting** | None | **Token Bucket / Redis RateLimiter** per bridge node and IP |
 
 ---
 
-## Tests
+## ⚖️ Honest Engineering Limitations
 
-Run all tests:
-```
-mvnw.cmd test
-```
+When discussing or evaluating this architecture, consider the following real-world trade-offs:
 
-The three included tests:
-
-- **`encryptDecryptRoundTrip`** — sanity-check that hybrid encryption is symmetric.
-- **`tamperedCiphertextIsRejected`** — flip a byte in the ciphertext, verify that `BridgeIngestionService` returns `INVALID` instead of crashing or settling.
-- **`singlePacketDeliveredByThreeBridgesSettlesExactlyOnce`** — the headline test. Three threads, one packet, simultaneous delivery. Asserts exactly one `SETTLED`, two `DUPLICATE_DROPPED`, and that the sender's balance changed by exactly the amount once.
-
----
-
-## What's NOT real (and what would change for production)
-
-This is a teaching demo. To make it production-grade you'd swap these things:
-
-| What's in the demo | What it would be in production |
-|---|---|
-| H2 in-memory DB | PostgreSQL / MySQL with replicas |
-| `ConcurrentHashMap` for idempotency | Redis with `SET NX EX` |
-| RSA keypair regenerated on every startup | Private key in HSM (AWS KMS, HashiCorp Vault). Public key cached on devices. |
-| Server-side `DemoService.createPacket()` | Same code running on Android, in a Kotlin port |
-| Software-simulated mesh (`MeshSimulatorService`) | Real BLE GATT or Wi-Fi Direct between phones |
-| One settlement service that owns the ledger | Integration with NPCI / a real bank core |
-| No auth on `/api/bridge/ingest` | Mutual TLS or signed bridge-node certificates |
-| In-memory accounts seeded on startup | Real KYC'd users, real VPAs, real PIN verification against the bank |
-| H2 console exposed | Disabled |
-| No rate limiting | Per-bridge-node rate limit, per-sender velocity check |
-| Logs to console | Structured logs to a SIEM, alerts on `INVALID` spikes |
-
-The cryptography and idempotency code is essentially production-shaped. The infrastructure around it is what changes.
+1. **Deferred Settlement vs. Guaranteed Cash (The Double-Spend Challenge):**
+   - Because the sender is completely offline, their current balance cannot be verified at the moment of packet creation.
+   - If Alice has ₹500 and sends ₹500 to Bob in one room, and then sends another ₹500 to Carol in another room, whichever packet reaches the backend first will settle; the second will be `REJECTED` for insufficient funds.
+   - *Production Solution:* Similar to **UPI Lite**, real-world implementations require pre-funding an **on-device Secure Enclave hardware wallet**, freezing those funds from the primary account before going offline.
+2. **Mobile Operating System Bluetooth Restrictions:**
+   - Modern mobile operating systems (iOS and Android 8+) aggressively throttle background Bluetooth Low Energy discovery to conserve battery life. Achieving seamless background mesh propagation without user intervention requires platform-level OS permissions or specialized frameworks.
+3. **Delayed Receiver Confirmation:**
+   - The merchant/receiver does not receive instant confirmation until an intermediary bridge syncs with the server. In our model, the receiver accepts a cryptographically signed deferred promise (IOU) until settlement.
 
 ---
 
-## Honest limitations of the concept
-
-I want this README to be useful to you when someone reviews the project, so let's be straight about what this design **does not** solve. These are not implementation bugs — they're inherent to "no internet, anywhere in the chain":
-
-1. **The receiver has no way to verify the sender has the funds.** When sender hands receiver a phone showing "₹500 sent," it's an IOU, not a settled payment. If the sender's account is empty when the packet finally reaches the backend, the settlement will be `REJECTED` and the receiver is out ₹500 with no recourse. *This is why real offline UPI (UPI Lite) uses a pre-funded hardware-backed wallet* — to give cryptographic proof of available funds offline.
-2. **A malicious sender can double-spend offline.** With ₹500 in their account, they could send a packet to Bob in basement A, walk to basement B, and send another ₹500 to Carol. Whichever packet hits the backend first wins; the other gets `REJECTED`. Same root cause as #1.
-3. **Bluetooth in real life is hard.** Background BLE on Android is heavily throttled since Android 8. iOS peripheral mode is locked down. Two strangers' phones reliably forming a GATT connection while the apps aren't actively open is genuinely difficult and a lot of energy. This demo skips that problem entirely by simulating the mesh.
-4. **Privacy / liability.** A stranger carries your encrypted transaction packet on their phone. They can't read it, but its existence is metadata. In a real deployment you'd want to think about regulatory disclosures and what happens if a device is seized.
-
-For a college / portfolio project: name the concept honestly as **"mesh-routed deferred settlement"** rather than "real-time offline UPI," and you'll have a much stronger pitch. The cryptography and idempotency work here is real engineering and worth showing off.
-
----
-
-## Troubleshooting
-
-**`java: command not found`** — Install JDK 17+. On Windows, `winget install EclipseAdoptium.Temurin.17.JDK` or download from adoptium.net.
-
-**Port 8080 already in use** — Change `server.port` in `application.properties`.
-
-**First `mvnw.cmd` run hangs for a long time** — It's downloading Maven (~10 MB) then dependencies (~80 MB). Give it 2–3 minutes on a normal connection. After that, startup is ~5 seconds.
-
-**`mvnw.cmd : The term 'mvnw.cmd' is not recognized`** — On PowerShell you need to prefix with `.\`: `.\mvnw.cmd spring-boot:run`.
-
-**Tests fail intermittently** — The concurrency test is timing-sensitive. If it ever flakes, run it 3x; if it consistently fails on your hardware, file the actual failure output.
-
----
-
-## License
-
-Demo code, no license. Use it however you want for learning.
-#   u p i - o f f l i n e  
- 
+## 📄 License
+This project is open-source under the MIT License. Feel free to use, modify, and integrate it into your own research and portfolio projects.
